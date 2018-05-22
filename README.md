@@ -11,7 +11,8 @@ to publish events, request services, listen for events or provide a service.
 ## Requirements
 
  * jython-standalone 2.7.1
- * OpenDXL Client library 3.0.1 (included in resources dir)
+ * OpenDXL Client library 4.0.0.418 (included in resources dir)
+ * Python configobj.py (included in resources dir)
 
 &nbsp;
 ## Installation
@@ -40,7 +41,7 @@ Add this dependency to your project's POM:
 <dependency>
 	<groupId>com.att.cso</groupId>
 	<artifactId>opendxl.jython.client</artifactId>
-	<version>0.0.4</version>		
+	<version>0.0.5</version>		
 </dependency>
 ```
 &nbsp;
@@ -108,7 +109,7 @@ for each example.
   	<dependency>
 		<groupId>com.att.cso</groupId>
 		<artifactId>opendxl.jython.client</artifactId>
-		<version>0.0.4</version>
+		<version>0.0.5</version>
 	</dependency>
   </dependencies>
   

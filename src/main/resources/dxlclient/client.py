@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Copyright (c) 2016 McAfee Inc. - All Rights Reserved.
+# Copyright (c) 2017 McAfee Inc. - All Rights Reserved.
 ################################################################################
 import threading
 import logging
 import ssl
 import traceback
 import random
+import time
 
 import paho.mqtt.client as mqtt # pylint: disable=import-error
 
@@ -17,7 +18,7 @@ from dxlclient._request_manager import RequestManager
 from dxlclient.exceptions import DxlException
 from dxlclient.message import Message, Event, Request, Response, ErrorResponse
 from dxlclient._thread_pool import ThreadPool
-from dxlclient.exceptions import _raise_wrapped_exception
+from dxlclient.exceptions import WaitTimeoutException
 from dxlclient.service import _ServiceManager
 from dxlclient._uuid_generator import UuidGenerator
 from _dxl_utils import DxlUtils
@@ -25,6 +26,7 @@ from _dxl_utils import DxlUtils
 __all__ = [
     # Callbacks
     "_on_connect", "_on_disconnect", "_on_message", "_on_log",
+    "_on_subscribe", "_on_unsubscribe",
     # Client
     "DxlClient",
     # Constants
@@ -48,14 +50,27 @@ DXL_ERR_INTERRUPT = 2
 
 def _on_connect(client, userdata, rc): # pylint: disable=invalid-name
     """
-    Called when the broker responds to our connection request.
+    Called when the client connects to the broker.
 
     :param client: The Paho MQTT client reference
     :param userdata: The user data object provided
     :param rc: The result code
     :return: None
     """
-    if userdata is None or not isinstance(userdata, DxlClient):
+    t = threading.Thread(target=_on_connect_run, args=[client, userdata, rc])
+    t.daemon = True
+    t.start()
+
+def _on_connect_run(client, userdata, rc): # pylint: disable=invalid-name
+    """
+    Worker method that is invoked when the client connects to the broker.
+
+    :param client: The Paho MQTT client reference
+    :param userdata: The user data object provided
+    :param rc: The result code
+    :return: None
+    """
+    if not isinstance(userdata, DxlClient):
         raise ValueError("User data object not specified")
 
     self = userdata
@@ -63,18 +78,22 @@ def _on_connect(client, userdata, rc): # pylint: disable=invalid-name
     with self._connected_lock:
         self._connected = True
 
-        logger.info("Connected with result code %s", str(rc))
+        logger.debug("Connected with result code %s", str(rc))
 
         # Subscribing in on_connect() means that if we lose the connection and
         # reconnect then subscriptions will be renewed.
         with self._subscriptions_lock:
-            for subscription in self._subscriptions:
-                try:
-                    logger.info("Subscribing to %s", subscription)
-                    client.subscribe(subscription)
-                except Exception as ex:
-                    logger.error("Error during subscribe: %s", ex.message)
-                    logger.debug(traceback.format_exc())
+            with self._packets_awaiting_ack_condition:
+                for subscription in self._subscriptions:
+                    try:
+                        logger.debug("Subscribing to %s", subscription)
+                        result, mid = client.subscribe(subscription)
+                        self._wait_packet_acked(result, mid,
+                                                "subscription to " +
+                                                subscription)
+                    except Exception as ex:
+                        logger.error("Error during subscribe: %s", str(ex))
+                        logger.debug(traceback.format_exc())
 
         if self._service_manager:
             self._service_manager.on_connect()
@@ -92,29 +111,48 @@ def _on_disconnect(client, userdata, rc): # pylint: disable=invalid-name
     :param rc: The result code
     :return: None
     """
+    if not isinstance(userdata, DxlClient):
+        raise ValueError("User data object not specified")
+
+    self = userdata
+    self._reset_packets_awaiting_ack()
+
+    t = threading.Thread(target=_on_disconnect_run, args=[client, userdata, rc])
+    t.daemon = True
+    t.start()
+
+
+def _on_disconnect_run(client, userdata, rc):  # pylint: disable=invalid-name
+    """
+    Worker method that is invoked when the client disconnects from the broker.
+
+    :param client: The Paho MQTT client reference
+    :param userdata: The user data object provided
+    :param rc: The result code
+    :return: None
+    """
     # Remove unused parameter
     del client
     # Check userdata; this needs to be an instance of the DxlClient
-    if userdata is None or not isinstance(userdata, DxlClient):
+    if not isinstance(userdata, DxlClient):
         raise ValueError("User data object not specified")
     self = userdata
 
     with self._connected_lock:
         self._connected = False
+        self._reset_current_broker()
         self._connected_wait_condition.notify_all()
 
-    self._reset_current_broker()
-
     if rc == 0:
-        logger.info("Disconnected with result code %s", str(rc))
+        logger.debug("Disconnected with result code %s", str(rc))
     else:
         logger.error("Unexpected disconnect with result code %s", str(rc))
-        # Disconnect the client without stopping the event loop
-        self._disconnect(stop_event_loop=False)
-        # Connect the client without starting a new event loop
-        # Start the connect thread
+        # Disconnect the client
+        self._disconnect()
+        # Connect the client
         if self.config.reconnect_when_disconnected:
-            self._start_connect_thread(start_event_loop=False)
+            self._start_connect_thread()
+
 
 def _on_message(client, userdata, msg): # pylint: disable=invalid-name
     """
@@ -133,7 +171,7 @@ def _on_message(client, userdata, msg): # pylint: disable=invalid-name
         raise ValueError("Client reference not specified")
     self = userdata
 
-    logger.info("Message received for topic %s", msg.topic)
+    logger.debug("Message received for topic %s", msg.topic)
 
     # TODO: The behavior is one thread per message, but the individual callbacks are handled sequential.
     # TODO: self is the same as in the Java client, but is not ideal.  One plugin could block the whole
@@ -142,8 +180,7 @@ def _on_message(client, userdata, msg): # pylint: disable=invalid-name
     try:
         self._thread_pool.add_task(self._handle_message, channel=msg.topic, payload=msg.payload)
     except Exception as ex:  # pylint: disable=broad-except
-        logger.error("Error handling message: %s", ex.message)
-        logger.debug(traceback.format_exc())
+        logger.exception("Error handling message")
 
 
 def _on_log(client, userdata, level, buf):
@@ -172,6 +209,45 @@ def _on_log(client, userdata, level, buf):
         logger.error("MQTT: %s", str(buf))
     elif level == mqtt.MQTT_LOG_DEBUG:
         logger.debug("MQTT: %s", str(buf))
+
+def _on_subscribe(client, userdata, mid, granted_qos):
+    """
+    Called when an ack message is received for a topic subscription that the
+    client has issued.
+
+    :param client: The Paho MQTT client reference
+    :param userdata: The user data object provided
+    :param mid: The message id of the MQTT subscription packet which corresponds
+        to the ack packet.
+    :param granted_qos: List of integers which gives the QoS level that the
+        broker has granted for the subscription request.
+    :return: None
+    """
+    del client
+    del granted_qos
+    # Check userdata; this needs to be an instance of the DxlClient
+    if not isinstance(userdata, DxlClient):
+        raise ValueError("Client reference not specified")
+    self = userdata
+    self._on_packet_ack(mid)
+
+def _on_unsubscribe(client, userdata, mid):
+    """
+    Called when an ack message is received for a topic unsubscription that the
+    client has issued.
+
+    :param client: The Paho MQTT client reference
+    :param userdata: The user data object provided
+    :param mid: The message id of the MQTT unsubscription packet which
+        corresponds to the ack packet.
+    :return: None
+    """
+    del client
+    # Check userdata; this needs to be an instance of the DxlClient
+    if not isinstance(userdata, DxlClient):
+        raise ValueError("Client reference not specified")
+    self = userdata
+    self._on_packet_ack(mid)
 
 ################################################################################
 #
@@ -239,6 +315,9 @@ class DxlClient(_BaseObject):
     _DEFAULT_QOS = 0
     # The default connect wait
     _DEFAULT_CONNECT_WAIT = 10  # seconds
+    # Maximum time to wait for a subscription / unsubscription packet to be
+    # acked (in seconds)
+    _MAX_PACKET_ACK_WAIT = 2 * 60
 
     def __init__(self, config):
         """
@@ -301,9 +380,9 @@ class DxlClient(_BaseObject):
 
         # The underlying MQTT client instance
         self._client = mqtt.Client(client_id=self._config._client_id,
-                                   clean_session=True,
-                                   userdata=self,
-                                   protocol=mqtt.MQTTv31)
+                                  clean_session=True,
+                                  userdata=self,
+                                  protocol=mqtt.MQTTv31)
 
         # The MQTT client connect callback
         self._client.on_connect = _on_connect
@@ -311,6 +390,11 @@ class DxlClient(_BaseObject):
         self._client.on_disconnect = _on_disconnect
         # The MQTT client message callback
         self._client.on_message = _on_message
+        # The MQTT client topic subscription callback
+        self._client.on_subscribe = _on_subscribe
+        # The MQTT client topic unsubscription callback
+        self._client.on_unsubscribe = _on_unsubscribe
+
         # The MQTT client log callback
         if logger.isEnabledFor(logging.DEBUG):
             self._client.on_log = _on_log
@@ -357,6 +441,9 @@ class DxlClient(_BaseObject):
 
         self._destroy_lock = threading.RLock()
         self._destroyed = False
+
+        self._packets_awaiting_ack = set()
+        self._packets_awaiting_ack_condition = threading.Condition()
 
     def __del__(self):
         """destructor"""
@@ -427,14 +514,14 @@ class DxlClient(_BaseObject):
         # Wait for the callback to be invoked
         with self._connected_lock:
             if not self.connected:
-                self._connected_wait_condition.wait(5)
+                self._connected_wait_condition.wait(self._DEFAULT_CONNECT_WAIT)
 
         # Check if we were connected
         if not self.connected:
             raise DxlException("Failed to establish connection")
 
-    def _start_connect_thread(self, start_event_loop=True, connect_retries=-1):
-        self._thread = threading.Thread(target=self._connect_thread_main, args=[start_event_loop, connect_retries])
+    def _start_connect_thread(self, connect_retries=-1):
+        self._thread = threading.Thread(target=self._connect_thread_main, args=[connect_retries])
         self._thread.daemon = True
         self._thread.start()
 
@@ -483,53 +570,65 @@ class DxlClient(_BaseObject):
         Attempts to disconnect the client from the DXL fabric.
         """
         if self._connected:
-            self._disconnect(stop_event_loop=True)
+            self._disconnect()
         else:
             logger.warning("Trying to disconnect a disconnected client.")
 
-    def _disconnect(self, stop_event_loop=False):
-
+    def _disconnect(self):
+        self._reset_packets_awaiting_ack()
         if self._service_manager:
             self._service_manager.on_disconnect()
 
-        logger.info("Waiting for thread pool completion...")
+        logger.debug("Waiting for thread pool completion...")
         self._thread_pool.wait_completion()
 
-        for subscription in self._subscriptions:
-            if self.connected:
-                try:
-                    logger.info("Unsubscribing from %s", subscription)
-                    self._client.unsubscribe(subscription)
-                except Exception as ex:  # pylint: disable=broad-except
-                    logger.error("Error during unsubscribe: %s", ex.message)
-                    logger.debug(traceback.format_exc())
+        with self._packets_awaiting_ack_condition:
+            for subscription in self._subscriptions:
+                if self.connected:
+                    try:
+                        logger.debug("Unsubscribing from %s", subscription)
+                        result, mid = self._client.unsubscribe(subscription)
+                        self._wait_packet_acked(result, mid,
+                                                "unsubscription to " +
+                                                subscription)
+                    except Exception as ex:  # pylint: disable=broad-except
+                        logger.error("Error during unsubscribe: %s", str(ex))
+                        logger.debug(traceback.format_exc())
 
         # In case of a reconnect after connection loss, the event loop will
         # not be stopped and the client will not be forcefully disconnected.
-        if stop_event_loop:
-            logger.info("Stopping event loop...")
-            self._client.loop_stop()
-            logger.info("Trying to disconnect client...")
-            self._client.disconnect()
-            logger.info("Disconnected.")
+        logger.debug("Stopping event loop...")
+        self._client.loop_stop()
+        logger.debug("Trying to disconnect client...")
+        self._client.disconnect()
+        logger.debug("Disconnected.")
 
         # Make sure the connection loop is done
         if self._thread is not None:
-            logger.info("Waiting for the thread to terminate...")
+            logger.debug("Waiting for the thread to terminate...")
             self._thread_terminate = True
             with self._connect_wait_lock:
                 self._connect_wait_condition.notifyAll()
             while self._thread.isAlive():
                 self._thread.join(1)
             self._thread = None
-            logger.info("Thread terminated.")
+            logger.debug("Thread terminated.")
 
-    def _connect_thread_main(self, start_loop, connect_retries):
+        # Wait for the callback to be invoked
+        with self._connected_lock:
+            if self.connected:
+                self._connected_wait_condition.wait(self._DEFAULT_CONNECT_WAIT)
+
+        # Check if we were disconnected
+        if self.connected:
+            raise DxlException("Failed to disconnect")
+
+    def _connect_thread_main(self, connect_retries):
         """
         The connection thread main function
         """
         self._thread_terminate = False
-        self._loop_until_connected(start_loop, connect_retries)
+        self._loop_until_connected(connect_retries)
 
     def _connect(self, brokers):
         """
@@ -557,7 +656,7 @@ class DxlClient(_BaseObject):
                 except Exception as ex:  # pylint: disable=broad-except
                     logger.error("Failed to connect to broker %s: %s",
                                  broker.to_string(),
-                                 ex.message)
+                                 str(ex))
                     logger.debug(traceback.format_exc())
                     latest_ex = ex
 
@@ -579,7 +678,7 @@ class DxlClient(_BaseObject):
 
                 if self._thread_terminate:
                     break
-                if self._current_broker is None and broker.ip_address is not None:
+                if self._current_broker is None and broker.ip_address:
                     try:
                         logger.info(
                             "Trying to connect to broker (IP address) %s (%s:%d)...",
@@ -600,7 +699,7 @@ class DxlClient(_BaseObject):
             if latest_ex is not None:
                 raise latest_ex  # pylint: disable=raising-bad-type
 
-    def _loop_until_connected(self, start_loop, connect_retries):
+    def _loop_until_connected(self, connect_retries):
 
         # The client is already connected
         if self.connected:
@@ -621,7 +720,7 @@ class DxlClient(_BaseObject):
             logger.debug("Stopping...")
             return DXL_ERR_INTERRUPT
 
-        logger.info("Checking brokers...")
+        logger.debug("Checking brokers...")
         brokers = self._config._get_sorted_broker_list()
 
         logger.info("Trying to connect...")
@@ -670,10 +769,9 @@ class DxlClient(_BaseObject):
             if latest_ex_traceback:
                 logger.debug(latest_ex_traceback)
 
-        logger.info("Launching event loop...")
+        logger.debug("Launching event loop...")
 
-        if start_loop:
-            self._client.loop_start()
+        self._client.loop_start()
 
         return DXL_ERR_SUCCESS
 
@@ -736,11 +834,10 @@ class DxlClient(_BaseObject):
             if topic not in self._subscriptions:
                 self._subscriptions.add(topic)
                 if self.connected:
-                    self._client.subscribe(topic)
-        except Exception as ex:
-            logger.error("Error during subscribe: %s", ex.message)
-            logger.debug(traceback.format_exc())
-            raise DxlException("Error during subscribe" + str(ex))
+                    with self._packets_awaiting_ack_condition:
+                        result, mid = self._client.subscribe(topic)
+                        self._wait_packet_acked(result, mid,
+                                                "subscription to " + topic)
         finally:
             logger.debug("%s(): Releasing Subscriptions lock.", DxlUtils.func_name())
             self._subscriptions_lock.release()
@@ -758,15 +855,74 @@ class DxlClient(_BaseObject):
         try:
             if topic in self._subscriptions:
                 if self.connected:
-                    self._client.unsubscribe(topic)
-        except Exception as ex:
-            logger.error("Error during unsubscribe: %s", ex.message)
-            logger.debug(traceback.format_exc())
-            raise DxlException("Error during unsubscribe")
+                    with self._packets_awaiting_ack_condition:
+                        result, mid = self._client.unsubscribe(topic)
+                        self._wait_packet_acked(result, mid,
+                                                "unsubscription to " + topic)
         finally:
-            self._subscriptions.remove(topic)
+            if topic in self._subscriptions:
+                self._subscriptions.remove(topic)
             logger.debug("%s(): Releasing Subscriptions lock.", DxlUtils.func_name())
             self._subscriptions_lock.release()
+
+    def _wait_packet_acked(self, result, mid, description):
+        """
+        Wait until an ack packet is delivered for an MQTT message or the broker
+        connection is dropped.
+
+        :param result: Result delivered by MQTT for the attempt to send the
+            original packet. If the Result is anything other than
+            MQTT_ERR_SUCCESS this function will assume that the original packet
+            was never sent and, therefore, that the function would not need to
+            wait for a corresponding ack packet.
+        :param mid: The message id of the MQTT packet which corresponds to the
+            ack packet.
+        :param description: Text string to include in the exception this
+            method raises if a timeout occurs while waiting for the ACK packet.
+        :raise WaitTimeoutException: if the ack packet is not received before
+            a timeout is reached.
+        """
+        with self._packets_awaiting_ack_condition:
+            if result == mqtt.MQTT_ERR_SUCCESS:
+                start = time.time()
+                self._packets_awaiting_ack.add(mid)
+                try:
+                    time_remaining = self._MAX_PACKET_ACK_WAIT
+                    while mid in self._packets_awaiting_ack and \
+                            time_remaining > 0:
+                        self._packets_awaiting_ack_condition.wait(
+                            time_remaining)
+                        time_remaining = start - time.time() + \
+                                         self._MAX_PACKET_ACK_WAIT
+                        if mid in self._packets_awaiting_ack:
+                            raise WaitTimeoutException(
+                                "Timeout waiting for " + description)
+                finally:
+                    if mid in self._packets_awaiting_ack:
+                        self._packets_awaiting_ack.remove(mid)
+
+    def _on_packet_ack(self, mid):
+        """
+        Callback invoked when a ack packet is received.
+
+        :param mid: The message id of the MQTT packet which corresponds to the
+            ack packet.
+        """
+        with self._packets_awaiting_ack_condition:
+            if mid in self._packets_awaiting_ack:
+                self._packets_awaiting_ack.remove(mid)
+                self._packets_awaiting_ack_condition.notify_all()
+
+    def _reset_packets_awaiting_ack(self):
+        """
+        Remove any pending ack packets. This is typically done as part of a
+        client disconnect - since the broker would no longer be able to ack
+        packets once the connection goes down.
+        """
+        with self._packets_awaiting_ack_condition:
+            if self._packets_awaiting_ack:
+                self._packets_awaiting_ack = set()
+                self._packets_awaiting_ack_condition.notify_all()
 
     @property
     def subscriptions(self):
@@ -833,12 +989,7 @@ class DxlClient(_BaseObject):
         :param payload: The message content
         :param qos: The quality of service (QOS)
         """
-        try:
-            self._client.publish(topic=channel, payload=payload, qos=qos)
-        except Exception as ex:  # pylint: disable=broad-except
-            logger.error("Error publishing message: %s", ex.message)
-            logger.debug(traceback.format_exc())
-            _raise_wrapped_exception("Error publishing message", ex)
+        self._client.publish(topic=channel, payload=payload, qos=qos)
 
     def _send_request(self, request):
         """
@@ -897,9 +1048,9 @@ class DxlClient(_BaseObject):
         :param request_callback: The :class:`dxlclient.callbacks.RequestCallback` to be invoked when a
             :class:`dxlclient.message.Request` message is received on the specified topic
         """
-        self._request_callbacks.add_callback(topic, request_callback)
+        self._request_callbacks.add_callback(("" if topic is None else topic), request_callback)
 
-    def remove_request_callback(self, channel, request_callback):
+    def remove_request_callback(self, topic, request_callback):
         """
         Removes a :class:`dxlclient.callbacks.RequestCallback` from the client for the specified topic. This method
         must be invoked with the same arguments as when the callback was originally registered via
@@ -908,7 +1059,7 @@ class DxlClient(_BaseObject):
         :param topic: The topic to remove the callback for
         :param request_callback: The :class:`dxlclient.callbacks.RequestCallback` to be removed for the specified topic
         """
-        self._request_callbacks.remove_callback(channel, request_callback)
+        self._request_callbacks.remove_callback(("" if topic is None else topic), request_callback)
 
     def add_response_callback(self, topic, response_callback):
         """
@@ -926,9 +1077,9 @@ class DxlClient(_BaseObject):
         :param request_callback: The :class:`dxlclient.callbacks.RequestCallback` to be invoked when a
             :class:`dxlclient.message.Request` message is received on the specified topic
         """
-        self._response_callbacks.add_callback(topic, response_callback)
+        self._response_callbacks.add_callback(("" if topic is None else topic), response_callback)
 
-    def remove_response_callback(self, channel, response_callback):
+    def remove_response_callback(self, topic, response_callback):
         """
         Removes a :class:`dxlclient.callbacks.ResponseCallback` from the client for the specified topic. This method
         must be invoked with the same arguments as when the callback was originally registered via
@@ -937,7 +1088,7 @@ class DxlClient(_BaseObject):
         :param topic: The topic to remove the callback for
         :param response_callback: The :class:`dxlclient.callbacks.ResponseCallback` to be removed for the specified topic
         """
-        self._response_callbacks.remove_callback(channel, response_callback)
+        self._response_callbacks.remove_callback(("" if topic is None else topic), response_callback)
 
     def add_event_callback(self, topic, event_callback, subscribe_to_topic=True):
         """
@@ -954,8 +1105,8 @@ class DxlClient(_BaseObject):
             (:func:`dxlclient.client.DxlClient.subscribe`) to the topic.
             By default the client will subscribe to the topic. Specify ``False`` to prevent subscribing to the topic.
         """
-        self._event_callbacks.add_callback(topic, event_callback)
-        if subscribe_to_topic is True:
+        self._event_callbacks.add_callback(("" if topic is None else topic), event_callback)
+        if subscribe_to_topic is True and topic is not None:
             self.subscribe(topic)
 
     def remove_event_callback(self, topic, event_callback, unsubscribe_from_topic=True):
@@ -970,8 +1121,8 @@ class DxlClient(_BaseObject):
             (:func:`dxlclient.client.DxlClient.unsubscribe`) from the topic. By default the client will unsubscribe
             from the topic. Specify ``False`` to prevent unsubscribing to the topic.
         """
-        self._event_callbacks.remove_callback(topic, event_callback)
-        if unsubscribe_from_topic is True:
+        self._event_callbacks.remove_callback(("" if topic is None else topic), event_callback)
+        if unsubscribe_from_topic is True and topic is not None:
             self.unsubscribe(topic)
 
     def _fire_request(self, request):

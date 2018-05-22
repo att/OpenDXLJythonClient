@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Copyright (c) 2016 McAfee Inc. - All Rights Reserved.
+# Copyright (c) 2017 McAfee Inc. - All Rights Reserved.
 ################################################################################
 
 from dxlclient import _BaseObject
@@ -57,13 +57,13 @@ class EventCallback(MessageCallback):  # pylint: disable=too-few-public-methods
         dxl_client.send_event(evt)
     """
 
-def on_event(self, event):
-    """
-    Invoked when an :class:`dxlclient.message.Event` has been received.
+    def on_event(self, event):
+        """
+        Invoked when an :class:`dxlclient.message.Event` has been received.
 
-    :param event: The :class:`dxlclient.message.Event` message that was received
-    """
-    raise NotImplementedError("Must be implemented in a child class.")
+        :param event: The :class:`dxlclient.message.Event` message that was received
+        """
+        raise NotImplementedError("Must be implemented in a child class.")
 
 
 class RequestCallback(MessageCallback):  # pylint: disable=too-few-public-methods
@@ -84,7 +84,7 @@ class RequestCallback(MessageCallback):  # pylint: disable=too-few-public-method
         raise NotImplementedError("Must be implemented in a child class.")
 
 
-class ResponseCallback(MessageCallback): # pylint: disable=too-few-public-methods
+class ResponseCallback(MessageCallback):  # pylint: disable=too-few-public-methods
     """
     Concrete instances of this interface are used to receive :class:`dxlclient.message.Response` messages.
 
@@ -110,6 +110,6 @@ class ResponseCallback(MessageCallback): # pylint: disable=too-few-public-method
         """
         Invoked when an :class:`dxlclient.message.Response` has been received.
 
-        :param request: The :class:`dxlclient.message.Response` message that was received
+        :param response: The :class:`dxlclient.message.Response` message that was received
         """
         raise NotImplementedError("Must be implemented in a child class.")

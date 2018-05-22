@@ -250,14 +250,12 @@ def topic_matches_sub(sub, topic):
 
 def _socketpair_compat():
     """TCP/IP socketpair including Windows support"""
-
     listensock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_IP)
     listensock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listensock.bind(("localhost", 0))
     listensock.listen(1)
 
     iface, port = listensock.getsockname()
-
     sock1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_IP)
     sock1.setblocking(0)
     try:
@@ -265,11 +263,9 @@ def _socketpair_compat():
     except socket.error as err:
         if err.errno != errno.EINPROGRESS and err.errno != errno.EWOULDBLOCK and err.errno != EAGAIN:
             raise
-
     sock2, address = listensock.accept()
     sock2.setblocking(0)
     listensock.close()
-
     return (sock1, sock2)
 
 

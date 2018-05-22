@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 ################################################################################
-# Copyright (c) 2016 McAfee Inc. - All Rights Reserved.
+# Copyright (c) 2017 McAfee Inc. - All Rights Reserved.
 ################################################################################
 import json
 import logging
@@ -113,6 +113,8 @@ class ServiceRegistrationInfo(_BaseObject):
         self._callbacks_by_topic = {}
         #The map of meta data associated with this service (name-value pairs)
         self._metadata = {}
+        # List of destination tenants
+        self._destination_tenant_guids = []
 
         # The Time-To-Live (TTL) of the service registration (default: 60 minutes)
         self._ttl = 60  # minutes
@@ -237,6 +239,20 @@ class ServiceRegistrationInfo(_BaseObject):
             raise ValueError("Undefined channel")
         for channel, callback in callbacks_by_topic.iteritems():
             self.add_topic(channel, callback)
+
+    @property
+    def destination_tenant_guids(self):
+        """
+        The set of tenant identifiers that the service will be available to. Setting this value will limit
+        which tenants can invoke the service.
+        """
+        return self._destination_tenant_guids
+
+    @destination_tenant_guids.setter
+    def destination_tenant_guids(self, tenant_guids=None):
+        if tenant_guids is None:
+            tenant_guids = []
+        self._destination_tenant_guids = tenant_guids
 
     def _wait_for_registration_notification(self, wait_time, is_register):
         """
@@ -392,18 +408,19 @@ class _ServiceRegistrationHandler(_BaseObject):
         """
         if not self.client:
             raise DxlException("Client not defined")
-        req = Request(destination_topic=_ServiceManager.DXL_SERVICE_REGISTER_REQUEST_CHANNEL)
-        req.payload = bytes(self.json_register_service())
-        response = self.client.sync_request(req, timeout=10)
-
-        if response.message_type != Message.MESSAGE_TYPE_ERROR:
-            self.update_register_time()
-            info = self.get_service()
-            if info:
-                info._notify_registration_succeeded()
-        else:
-            # TODO: Notify the client with an exception if an error occurred, so that it doesn't wait for timeout
-            logger.error("Error registering service.")
+        with self.lock:
+            req = Request(destination_topic=_ServiceManager.DXL_SERVICE_REGISTER_REQUEST_CHANNEL)
+            req.payload = self.json_register_service()
+            req.destination_tenant_guids = self.get_service().destination_tenant_guids
+            response = self.client.sync_request(req, timeout=10)
+            if response.message_type != Message.MESSAGE_TYPE_ERROR:
+                self.update_register_time()
+                info = self.get_service()
+                if info:
+                    info._notify_registration_succeeded()
+            else:
+                # TODO: Notify the client with an exception if an error occurred, so that it doesn't wait for timeout
+                logger.error("Error registering service.")
 
     def send_unregister_service_event(self):
         """
@@ -413,22 +430,26 @@ class _ServiceRegistrationHandler(_BaseObject):
         """
         if not self.client:
             raise DxlException("Client not defined")
-        # Send the unregister event only if the register event was sent before and TTL has not yet expired.
-        current_time = int(time.time())
-        last_register_time = self.get_register_time()
+        with self.lock:
+            # Send the unregister event only if the register event was sent before and TTL has not yet expired.
+            current_time = int(time.time())
+            last_register_time = self.get_register_time()
 
-        if last_register_time > 0 and (current_time - last_register_time) <= (self.ttl * 60):
-            request = Request(destination_topic=_ServiceManager.DXL_SERVICE_UNREGISTER_REQUEST_CHANNEL)
-            request.payload = bytes(self.json_unregister_service())
-            response = self.client.sync_request(request, timeout=60)
-            if response.message_type != Message.MESSAGE_TYPE_ERROR:
-                info = self.get_service()
-                if info:
-                    info._notify_unregistration_succeeded()
+            if last_register_time > 0 and (current_time - last_register_time) <= (self.ttl * 60):
+                request = Request(destination_topic=_ServiceManager.DXL_SERVICE_UNREGISTER_REQUEST_CHANNEL)
+                request.payload = self.json_unregister_service()
+                response = self.client.sync_request(request, timeout=60)
+                if response.message_type == Message.MESSAGE_TYPE_ERROR:
+                    raise DxlException("Unregister service request timed out")
             else:
-                raise DxlException("Unregister service request timed out")
-        else:
-            raise DxlException("Unregister service request timed out")
+                if last_register_time > 0:
+                    logger.info(
+                        "TTL expired, unregister service event omitted for " +
+                        self.service_type + " (" + self.instance_id +
+                        ")")
+            info = self.get_service()
+            if info:
+                info._notify_unregistration_succeeded()
 
     def get_register_time(self):
         """
@@ -467,16 +488,17 @@ class _ServiceRegistrationHandler(_BaseObject):
     def _timer_callback(self):
         """Callback invoked by the timer task (to re-register the service"""
         if self.client.connected:
-            # Send unregister event if service marked for deletion or is no longer valid
-            if self.deleted or self.is_invalid_reference():
-                self.mark_for_deletion()
-                self.send_unregister_service_event()
-                self.ttl_timer.cancel()
-            else:
-                self.send_register_service_request()
-                self.ttl_timer = Timer(self.ttl * 60, self._timer_callback)
-                self.ttl_timer.daemon = True
-                self.ttl_timer.start()
+            with self.lock:
+                # Send unregister event if service marked for deletion or is no
+                # longer valid
+                if self.deleted or self.is_invalid_reference():
+                    self.mark_for_deletion()
+                    self.send_unregister_service_event()
+                    self.ttl_timer.cancel()
+                else:
+                    self.send_register_service_request()
+                    self.ttl_timer = Timer(self.ttl * 60, self._timer_callback)
+                    self.ttl_timer.start()
         else:
             if self.ttl_timer:
                 self.ttl_timer.cancel()
@@ -492,7 +514,6 @@ class _ServiceRegistrationHandler(_BaseObject):
 
         if self.client.connected and not self.deleted:
             self.ttl_timer = Timer(0, self._timer_callback)
-            self.ttl_timer.daemon = True
             self.ttl_timer.start()
 
     def stop_timer(self):
@@ -508,7 +529,7 @@ class _ServiceRegistrationHandler(_BaseObject):
     def json_register_service(self):  # instanceId or service guid?
         return json.dumps({
             'serviceType': self.service_type,
-            'metadata': self.metadata,
+            'metaData': self.metadata,
             'requestChannels': list(self.channels),
             'ttlMins': self.ttl,
             'serviceGuid': self.instance_id
@@ -550,7 +571,7 @@ class _ServiceManager(RequestCallback):
     def destroy(self):
         """Destroys the service manager (releases resources)"""
         with self.lock:
-            for key in self.services.keys():
+            for key in list(self.services.keys()):
                 self.remove_service(key)
             self.__client = None
 
@@ -573,7 +594,11 @@ class _ServiceManager(RequestCallback):
 
             # Add service to registry
             service_handler = _ServiceRegistrationHandler(self.__client, service_reg_info)
-            self.services[service_reg_info._service_id] = service_handler
+            # Add the new service handler into a copy of self.services. This
+            # avoids causing issues with any readers using the current value of
+            # the object.
+            services = self.services.copy()
+            services[service_reg_info._service_id] = service_handler
 
             # Subscribe channels
             for channel in service_reg_info.topics:
@@ -583,6 +608,8 @@ class _ServiceManager(RequestCallback):
             if self.__client.connected:
                 service_handler.start_timer()
 
+            self.services = services
+
     def remove_service(self, service_id):
         """
         Removes the specified service.
@@ -590,7 +617,7 @@ class _ServiceManager(RequestCallback):
         :param instanceId: The instance ID of the service to remove.
         :return: None.
         """
-        if not isinstance(service_id, (type, str)):
+        if not isinstance(service_id, (type, basestring)):
             raise ValueError("Expected service id")
 
         if not service_id:
@@ -617,8 +644,13 @@ class _ServiceManager(RequestCallback):
                     logger.error("Error sending unregister service event for " +
                          service_handler.service_type + " (" + service_handler.instance_id + "): " + str(ex))
 
-            del self.services[service_id]
+            # Remove the service handler from a copy of self.services. This
+            # avoids causing issues with any readers using the current value of
+            # the object.
+            services = self.services.copy()
+            del services[service_id]
             service_handler.destroy(unregister=False)
+            self.services = services
 
     def on_request(self, request):
         """
@@ -627,18 +659,22 @@ class _ServiceManager(RequestCallback):
         :param request: The request.
         :return: None.
         """
-        with self.lock:
-            service_instance_id = request.service_id
-            if not service_instance_id:
-                for service in self.services:
-                    self._on_request(self.services[service], request)
+        # Store the current value of self.services in a local variable before
+        # accessing its contents. This should ensure that if
+        # self.callbacks_by_channel is reassigned after the lock is released
+        # that no concurrent modification errors are encountered.
+        services = self.services
+        service_instance_id = request.service_id
+        if not service_instance_id:
+            for service_id in services:
+                self._on_request(services[service_id], request)
+        else:
+            service_registration_handler = services.get(service_instance_id)
+            if service_registration_handler:
+                self._on_request(service_registration_handler, request)
             else:
-                service_registration_handler = self.services.get(service_instance_id)
-                if service_registration_handler:
-                    self._on_request(service_registration_handler, request)
-                else:
-                    logger.warning("No service with GUID " + service_instance_id + " registered. Ignoring request.")
-                    self.send_service_not_found_error_message(request)
+                logger.warning("No service with GUID " + service_instance_id + " registered. Ignoring request.")
+                self.send_service_not_found_error_message(request)
 
     def send_service_not_found_error_message(self, request):
         """
@@ -667,22 +703,25 @@ class _ServiceManager(RequestCallback):
         :return: None
         """
         with self.lock:
+            services = {}
             for service_id in self.services:
-                if self.services[service_id].is_deleted() or self.services[service_id].is_invalid_reference():
+                service_handler = self.services[service_id]
+                if service_handler.is_deleted() or service_handler.is_invalid_reference():
                     try:
-                        self.services[service_id].send_unregister_service_event()
-                        del self.services[service_id]
+                        service_handler.send_unregister_service_event()
                     except Exception, ex:
                         logger.error("Error sending unregister service event for " +
-                                     self.services[service_id].service_type + " (" +
-                                     self.services[service_id].instance_id + "): " + str(ex))
+                                     service_handler.service_type + " (" +
+                                     service_handler.instance_id + "): " + str(ex))
                 else:
+                    services[service_id] = service_handler
                     try:
-                        self.services[service_id].start_timer()
+                        service_handler.start_timer()
                     except Exception, ex:
                         logger.error("Failed to start timer thread for service " +
-                                     self.services[service_id].service_type + " (" +
-                                     self.services[service_id].instance_id + "): " + str(ex))
+                                     service_handler.service_type + " (" +
+                                     service_handler.instance_id + "): " + str(ex))
+            self.services = services
 
     def on_disconnect(self):
         """
@@ -692,13 +731,13 @@ class _ServiceManager(RequestCallback):
         :return: None.
         """
         with self.lock:
-
-            for handler in self.services:
+            for service_id in self.services:
+                service_handler = self.services[service_id]
                 if self.__client.connected:
                     try:
-                        self.services[handler].send_unregister_service_event()
+                        service_handler.send_unregister_service_event()
                     except Exception, ex:
                         logger.error("Error sending unregister service event for " +
-                                     self.services[handler].service_type + " (" +
-                                     self.services[handler].instance_id + "): " + str(ex))
-                self.services[handler].stop_timer()
+                                     service_handler.service_type + " (" +
+                                     service_handler.instance_id + "): " + str(ex))
+                service_handler.stop_timer()
