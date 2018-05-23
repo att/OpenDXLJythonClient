@@ -63,28 +63,39 @@ class ServiceProvider(DxlProviderInterface):
     def __init__(self):
         self.started = False
         self.loop = True
-        
-    def start(self, config_file="./dxlclient.config", service="/dsa/dxl/test", topic="/dsa/dxl/test/event2", dxl_callback=None):
+
+    def start(self, config_file="./dxlclient.config", service="/dsa/dxl/test", *args):
         if self.started:
             raise DxlJythonException(2000, "Already started")
-        if not dxl_callback:
+
+        if len(args) == 2:
+            # Topic and callback were specified in separate parameters
+            if not args[1]:
+                raise DxlJythonException(2100, "DXL callback is required")
+            topic = args[0] or "/dsa/dxl/test/event2"
+            callbacks_by_topic = {topic: args[1]}
+            topic_info = "topic '%s'" % topic
+        elif len(args) == 1:
+            # Topics/callbacks were specified in a map
+            callbacks_by_topic = args[0]
+            topic_info = "topics '%s'" % ",".join(list(callbacks_by_topic.keys()))
+        else:
             raise DxlJythonException(2100, "DXL callback is required")
-        
+
         try:
-            logger.info("Starting service '%s' on topic '%s'", service, topic)
+            logger.info("Starting service '%s' on %s", service, topic_info)
             logger.info("Reading configuration file from '%s'", config_file)
             config = DxlClientConfig.create_dxl_config_from_file(config_file)
               
             # Initialize DXL client using our configuration
             with DxlClient(config) as client:
-
                 # Connect to DXL Broker
                 client.connect()
-            
+
                 class MyRequestCallback(RequestCallback):
                     def __init__(self, dxl_callback):
                         self.dxlCallback = dxl_callback
-                        
+
                     def on_request(self, request):
                         dxl_message = JavaDxlMessage()
                         dxl_message.setTopic(request.destination_topic)
@@ -105,12 +116,14 @@ class ServiceProvider(DxlProviderInterface):
                         resp = self.dxlCallback.callbackEvent(dxl_message)
                         response.payload = resp.encode()
                         client.send_response(response)
-                
+
                 # Create DXL Service Registration object
                 service_registration_info = ServiceRegistrationInfo(client, str(service))
 
-                # Add a topic for the service to respond to
-                service_registration_info.add_topic(str(topic), MyRequestCallback(dxl_callback))
+                # Add topics for the service to respond to
+                service_registration_info.add_topics(
+                    {str(k): MyRequestCallback(v)
+                     for k, v in callbacks_by_topic.iteritems()})
 
                 # Register the service with the DXL fabric (with a wait up to 10 seconds for registration to complete)
                 client.register_service_sync(service_registration_info, 10)
@@ -118,9 +131,9 @@ class ServiceProvider(DxlProviderInterface):
                 self.started = True
                 while self.loop:
                     time.sleep(1)
-                
-                logger.info("Shutting down service '%s' on topic '%s'", service, topic)
-                return "Shutting down service provider on topic '%s'" % topic
+
+                logger.info("Shutting down service '%s' on %s", service, topic_info)
+                return "Shutting down service provider on %s" % topic_info
                 
         except Exception as e:
             logger.error("Exception $s", e.message)
