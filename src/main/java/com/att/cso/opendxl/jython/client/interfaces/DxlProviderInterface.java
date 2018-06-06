@@ -32,6 +32,8 @@ package com.att.cso.opendxl.jython.client.interfaces;
 
 import com.att.cso.opendxl.jython.client.exceptions.DxlJythonException;
 
+import java.util.Map;
+
 /**
  * Simple interface to bridge Java and Python modules to listen for messages 
  * from DXL. Python modules should import this interface. i.e.
@@ -51,7 +53,18 @@ public interface DxlProviderInterface {
 	 * @throws DxlJythonException Thrown when unable to create a connection and start a listener
 	 */
 	public String start(String configFile, String service, String topic, DxlCallbackInterface dxlCallback) throws DxlJythonException;
-	
+
+	/**
+	 * Provider start method to run the service
+	 *
+	 * @param configFile location of the dxlclient.config file
+	 * @param service service name ("/my/service/foo")
+	 * @param dxlCallbacksByTopic map of topic names ("/my/service/foo/bar") to corresponding java callback implementations to process message payload
+	 * @return message that indicates reason for exiting the implementer
+	 * @throws DxlJythonException Thrown when unable to create a connection and start a listener
+	 */
+	public String start(String configFile, String service, Map<String, DxlCallbackInterface> dxlCallbacksByTopic) throws DxlJythonException;
+
 	/**
 	 * Stop the executing service
 	 */
