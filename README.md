@@ -35,13 +35,17 @@ mvn clean install
 &nbsp;
 ### Maven use in your project
 
+At this time, this library is not yet available in Central Maven.  To use this
+library you will need to clone the project and then build locally to be able 
+to include in your maven project.
+
 Add this dependency to your project's POM:
 
 ```xml
 <dependency>
 	<groupId>com.att.cso</groupId>
 	<artifactId>opendxl.jython.client</artifactId>
-	<version>0.0.5</version>		
+	<version>1.0.0</version>		
 </dependency>
 ```
 &nbsp;
@@ -109,7 +113,7 @@ for each example.
   	<dependency>
 		<groupId>com.att.cso</groupId>
 		<artifactId>opendxl.jython.client</artifactId>
-		<version>0.0.5</version>
+		<version>1.0.0</version>
 	</dependency>
   </dependencies>
   
