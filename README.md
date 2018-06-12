@@ -45,7 +45,7 @@ Add this dependency to your project's POM:
 <dependency>
 	<groupId>com.att.cso</groupId>
 	<artifactId>opendxl.jython.client</artifactId>
-	<version>1.0.0</version>		
+	<version>0.0.5</version>		
 </dependency>
 ```
 &nbsp;
@@ -113,7 +113,7 @@ for each example.
   	<dependency>
 		<groupId>com.att.cso</groupId>
 		<artifactId>opendxl.jython.client</artifactId>
-		<version>1.0.0</version>
+		<version>0.0.5</version>
 	</dependency>
   </dependencies>
   
